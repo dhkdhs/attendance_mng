@@ -1,44 +1,48 @@
-#!/usr/bin/env python3
-"""
-attendance_gui.py
-
-GUI 기반 근태 자동정리기
-- 연/월 입력
-- 공장 파일 선택 (선택)
-- 사무실 파일 선택 (선택)
-- 보고 템플릿 파일 선택 (사용자 제공; 기본 템플릿 선택 가능)
-- 출력 폴더 선택
-- 실행 시: 기존 출력파일(근태결과_YYYYMM.xlsx)이 있으면 해당 시트만 갱신(입력한 쪽만), 없으면 생성
-- 병합 규칙: 같은 성명+날짜 -> 출근=min(출근들), 퇴근=max(퇴근들)
-"""
-
-import sys, os
-import tkinter as tk
-from tkinter import filedialog, messagebox
-import pandas as pd
-from datetime import datetime
-from pathlib import Path
-import openpyxl
-from openpyxl.utils.dataframe import dataframe_to_rows
+import os
+import sys
 import shutil
+import pandas as pd
+from pathlib import Path
+import datetime
+import time
+import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from openpyxl import load_workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
+from typing import Dict, List, Tuple, Optional
+from openpyxl.worksheet.worksheet import Worksheet
 
-import traceback
 
-APP_VERSION = "v1.0.0"
-DEVELOPER = "왕형순"
-BUILD_DATE = "2025-10-23"
+# ---------------------- 공용 유틸 ----------------------
+def resource_path(relative_path: str) -> str:
+    """PyInstaller 빌드 후에도 템플릿 등 리소스 접근 가능"""
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
 
-# ----------------- 데이터 처리 -----------------
 
-def process_factory(file):
-    if not file:
+def safe_to_hm(value: str) -> Optional[str]:
+    """시간값을 'HH:MM' 문자열로 변환"""
+    if pd.isna(value):
+        return None
+    try:
+        t = pd.to_datetime(value)
+        return t.strftime("%H:%M")
+    except Exception:
+        return None
+
+
+# ---------------------- 데이터 처리 ----------------------
+def process_factory(factory_path: str):
+    """공장 근태 raw 데이터 파싱"""
+    if not factory_path:
         return pd.DataFrame(columns=['성명','사번','부서','날짜','출근시간','퇴근시간'])
     try:
-        # df = pd.read_excel(file)
-        # 1) 일반적으로 읽기 (헤더가 복수라인이면 아래에서 재시도)
-        # df = pd.read_excel(factory_path, engine='openpyxl', header=3, dtype=str)
         for i in range(5):
-            df_tmp = pd.read_excel(file, engine='openpyxl', header=i)
+            df_tmp = pd.read_excel(factory_path, engine='openpyxl', header=i)
             cols = [str(c).strip() for c in df_tmp.columns]
             if "출입날짜" in cols and "출입시간" in cols:
                 df = df_tmp
@@ -52,28 +56,33 @@ def process_factory(file):
     # 모든 컬럼명에서 공백 제거
     df.columns = df.columns.str.strip()
 
-    # 진단: 실제 컬럼 확인 (콘솔 출력 + 메시지박스 로그는 필요시 활용)
-    print("[DEBUG] process_factory - columns:", df.columns.tolist())
+    rename_map = {
+        "출입날짜": "날짜",
+        "출입시간": "시간",
+        "사  번": "사번",
+        "이  름": "성명",
+        "기능키": "기능키"
+    }
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
 
-    df = df[df['기능키'].isin(['출근','출입','퇴근'])].copy()
-    df['날짜'] = pd.to_datetime(df['출입날짜'], format="%Y-%m-%d", errors='coerce').dt.date
-    df['시간'] = pd.to_datetime(df['출입시간'], format="%H:%M:%S", errors='coerce').dt.time
-    df['성명'] = df['이  름']
-    df['사번'] = df['사  번']
-    grouped = (
-        df.groupby(['성명','사번','날짜'])
-        .agg(출근시간=('시간','min'),
-            퇴근시간=('시간','max'))
-        .reset_index()
+    df["시간_raw"] = df["시간"].astype(str)
+    df["시간_hm"] = df["시간_raw"].apply(safe_to_hm)
+    df["날짜"] = pd.to_datetime(df["날짜"]).dt.date
+
+    result = df.groupby(["성명", "사번", "날짜"], as_index=False).agg(
+        출근시간=("시간_hm", "min"),
+        퇴근시간=("시간_hm", "max")
     )
-    grouped['구분'] = '공장'
-    return grouped
+    result["구분"] = "공장"
+    return result
 
-def process_office(file):
-    if not file:
+
+def process_office(office_path: str, year: str, month: str):
+    # """사무실 근태 raw 데이터 파싱"""
+    if not office_path:
         return pd.DataFrame(columns=['성명','사번','부서','날짜','출근시간','퇴근시간'])
     try:
-        wb = openpyxl.load_workbook(file, data_only=True)
+        wb = load_workbook(office_path, data_only=True)
         ws = wb.active
     except Exception as e:
         messagebox.showerror("파일 읽기 실패", f"사무실 파일을 읽는 중 에러:\n{e}")
@@ -92,8 +101,6 @@ def process_office(file):
             end = None
             date = c-4
 
-            # start = ws.cell(r, c).value
-            # end = ws.cell(r+1, c).value
             time_stamp = ws.cell(r+1, date).value
             if time_stamp is not None:
                 time_stamp_split = time_stamp.splitlines()
@@ -115,30 +122,161 @@ def process_office(file):
     df = df.reindex(columns=['성명','사번','날짜','출근시간','퇴근시간','구분'])
     return df
 
-def resource_path(relative_path):
-    try:
-        base_path = sys._MEIPASS
-    except Exception:
-        base_path = os.path.abspath(".")
-    return os.path.join(base_path, relative_path)
 
-def merge_data(factory_df=None, office_df=None):
-    dfs = [df for df in [factory_df, office_df] if df is not None]
-    if not dfs:
-        return pd.DataFrame()
-    df = pd.concat(dfs, ignore_index=True)
-    df = df.sort_values(by=['성명','사번','날짜','출근시간'])
-    df = df.groupby(['성명','사번','날짜'], as_index=False).agg({
-        '출근시간':'min',
-        '퇴근시간':'max',
-        '구분':'first'
-    })
-    df['근무시간'] = (
-        pd.to_datetime(df['퇴근시간'].astype(str)) -
-        pd.to_datetime(df['출근시간'].astype(str))
-    ).dt.total_seconds() / 3600
-    return df
+# ---------------------- 보고용 시트 매핑 ----------------------
+def to_time(value) -> Optional[datetime.time]:
+    if isinstance(value, datetime.time):
+        return value
+    if isinstance(value, datetime.datetime):
+        return value.time()
+    if isinstance(value, str):
+        try:
+            return datetime.datetime.strptime(value.strip(), "%H:%M").time()
+        except ValueError:
+            pass
+    return None
 
+
+def to_day_on_sheet(day: int, day_of_weekday: int):
+    day_of_week_list = ['월', '화', '수', '목', '금', '토', '일']
+    result_str = str(day) + '(' + day_of_week_list[day_of_weekday] + ')'
+    return result_str
+
+
+def iter_parse_report_sheet(ws: Worksheet, year_str: str, month_str: str) -> Dict[str, Dict[int, Tuple[int, int, int]]]:
+    result_cells = {}
+    for r in range(2, ws.max_row + 1):
+        day_cells = {}
+
+        val = ws.cell(r+1, 1).value
+        if val != '성명' and pd.notna(val):
+            val_split = val.splitlines()
+            name = val_split[0]
+
+            for c in range(3, ws.max_column + 1):
+                day = ws.cell(r, c).value
+                if pd.notna(day) and isinstance(day, int):
+                    if 1 <= int(day) <= 31:
+                        day_of_week = datetime.date(int(year_str), int(month_str), day).weekday()
+                        day_cells[day] = (r, c, day_of_week)
+
+            for c in range(3, ws.max_column + 1):
+                day = ws.cell(r+8, c).value
+                if pd.notna(day) and isinstance(day, int):
+                    if 1 <= int(day) <= 31:
+                        day_of_week = datetime.date(int(year_str), int(month_str), day).weekday()
+                        day_cells[day] = (r+8, c, day_of_week)
+
+            result_cells[name] = day_cells
+    return result_cells
+
+
+def find_target_row(ws: Worksheet, name: str, header_row: int) -> Optional[int]:
+    for r in range(header_row + 1, min(ws.max_row, header_row + 6)):
+        n = ws.cell(r, 1).value
+        if n is not None:
+            n_split = n.splitlines()
+            n_name = n_split[0]
+            if n_name == name:
+                return r
+    return None
+
+
+def apply_attendance(ws: Worksheet, df: pd.DataFrame, year_str: str, month_str: str):
+    """
+    정리테이블(df)의 근태 데이터를 보고용 시트(ws)에 반영
+    - 출근, 퇴근, 근무시간, 연장근무, 휴일근무 자동 기입
+    """
+    result_cells = iter_parse_report_sheet(ws, year_str, month_str)
+    if not (result_cells):
+        return
+
+    for key in result_cells:
+        emp_records = df[(df["성명"] == key)]
+        if emp_records.empty:
+            continue
+
+        for _, record in emp_records.iterrows():
+            if pd.isna(record["날짜"]):
+                continue
+            date = pd.to_datetime(record["날짜"])
+            day = int(date.day)
+
+            day_cells = result_cells[key]
+            if day not in day_cells:
+                continue
+
+            s, e = to_time(record["출근시간"]), to_time(record["퇴근시간"])
+            if not s and not e:
+                continue
+
+            header_row, col, day_of_weekday = day_cells[day]
+
+            # 이름이 있는 행(n행)을 찾고, 그 아래 5행 블록을 채운다.
+            target_row = find_target_row(ws, key, header_row)
+            if not target_row:
+                continue
+
+            row_in = target_row             # 출근시간
+            row_out = target_row + 1        # 퇴근시간
+            row_work = target_row + 2       # 근무시간
+            row_ot = target_row + 3         # 연장근무
+            row_holiday = target_row + 4    # 휴일근무
+
+            # 보고용 시트에 날짜 입력
+            ws.cell(header_row, col).value = to_day_on_sheet(day, day_of_weekday)
+
+            # 출근시간 및 퇴근시간
+            if s:
+                ws.cell(row_in, col).value = s.strftime("%H:%M")
+            if e:
+                ws.cell(row_out, col).value = e.strftime("%H:%M")
+
+            # 근무시간 계산
+            work_hours = None
+            if s and e:
+                s_dt = datetime.datetime.combine(datetime.datetime.today(), s)
+                e_dt = datetime.datetime.combine(datetime.datetime.today(), e)
+                work_hours = round((e_dt - s_dt).seconds / 3600, 1)
+                ws.cell(row_work, col).value = work_hours
+
+            # 연장근무 (퇴근 > 17:00)
+            if s and e and e > datetime.time(17, 0):
+                after5 = (datetime.datetime.combine(datetime.datetime.today(), e) -
+                            datetime.datetime.combine(datetime.datetime.today(), datetime.time(17, 0))).seconds / 3600
+                ws.cell(row_ot, col).value = round(after5, 1)
+            else:
+                ws.cell(row_ot, col).value = ""
+
+            # 휴일근무 (토:5, 일:6)
+            if day_of_weekday in (5, 6) and work_hours:
+                ws.cell(row_holiday, col).value = work_hours
+            else:
+                ws.cell(row_holiday, col).value = ""
+
+
+def update_report_sheet(wb, year_str: str, month_str: str):
+    """정리테이블 → {YY.MM} 시트 반영"""
+    sheet_name = f"{year_str[2:]}.{month_str}"
+    if "정리테이블" not in wb.sheetnames:
+        return
+    ws_data = wb["정리테이블"]
+    df = pd.DataFrame(list(ws_data.values)[1:], columns=list(ws_data.values)[0])
+    if sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        wb.remove(ws)
+    tmp_sheet = wb['tmp']
+    report_sheet = wb.copy_worksheet(tmp_sheet)
+    report_sheet.title = sheet_name
+    report_sheet['A1'] = '㈜대영인텍 출퇴근기록부 - ' + str(year_str) + '년 ' + str(month_str) + '월'
+    apply_attendance(wb[sheet_name], df, year_str, month_str)
+
+    wb.move_sheet('tmp', 4)
+    wb.move_sheet(sheet_name, -3)
+    wb.move_sheet('정리테이블', -2)
+
+
+# ---------------------- 엑셀 갱신 ----------------------
 def update_excel(factory_df, office_df, merged_df, year_str, month_str):
     out_path = Path(f"output/근태기록_{year_str}_{month_str}.xlsx")
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -147,139 +285,134 @@ def update_excel(factory_df, office_df, merged_df, year_str, month_str):
     if not out_path.exists():
         shutil.copy(template, out_path)
 
-    wb = openpyxl.load_workbook(out_path)
-    # 갱신 대상 시트만 재작성
+    wb = load_workbook(out_path)
+
+    def update_sheet(sheet_name, df):
+        from openpyxl.utils.dataframe import dataframe_to_rows
+        if sheet_name not in wb.sheetnames:
+            ws = wb.create_sheet(sheet_name)
+        else:
+            ws = wb[sheet_name]
+            ws.delete_rows(2, ws.max_row)
+        for r in dataframe_to_rows(df, index=False, header=True):
+            ws.append(r)
+
     if factory_df is not None:
-        if "공장데이터" in wb.sheetnames:
-            ws = wb["공장데이터"]
-            wb.remove(ws)
-        ws = wb.create_sheet("공장데이터")
-        for r in dataframe_to_rows(factory_df, index=False, header=True):
-            ws.append(r)
-
+        update_sheet("공장데이터", factory_df)
     if office_df is not None:
-        if "사무실데이터" in wb.sheetnames:
-            ws = wb["사무실데이터"]
-            wb.remove(ws)
-        ws = wb.create_sheet("사무실데이터")
-        for r in dataframe_to_rows(office_df, index=False, header=True):
-            ws.append(r)
+        update_sheet("사무실데이터", office_df)
+    if merged_df is not None:
+        update_sheet("정리테이블", merged_df)
 
-    if not merged_df.empty:
-        if "정리테이블" in wb.sheetnames:
-            ws = wb["정리테이블"]
-            wb.remove(ws)
-        ws = wb.create_sheet("정리테이블")
-        for r in dataframe_to_rows(merged_df, index=False, header=True):
-            ws.append(r)
-
-        # 보고용 시트 갱신
-        # if "보고용" in wb.sheetnames:
-        #     ws = wb["보고용"]
-        #     wb.remove(ws)
-        # ws = wb.create_sheet("보고용")
-        # ws["A1"] = f"{year_str}_{month_str} 근태 보고서"
-        # for r_idx, row in enumerate(merged_df.itertuples(), start=3):
-        #     ws.cell(r_idx, 1).value = row.성명
-        #     ws.cell(r_idx, 2).value = row.날짜.strftime("%Y-%m-%d")
-        #     ws.cell(r_idx, 3).value = str(row.출근시간)
-        #     ws.cell(r_idx, 4).value = str(row.퇴근시간)
-        #     ws.cell(r_idx, 5).value = round(row.근무시간, 2)
-
-        print("year_str type" + type(year_str))
-
-        report_sheet_name = str(year_str % 100) + '.' + str(month_str)
-        if report_sheet_name in wb.sheetnames:
-            ws = wb[report_sheet_name]
-            wb.remove(ws)
-        ws = wb.copy_worksheet("tmp")
-        ws.title = report_sheet_name
-        ws['A1'] = '㈜대영인텍 출퇴근기록부 - ' + str(year_str) + '년 ' + str(month_str) + '월'
-
-        wb.move_sheet('tmp', 4)
-        wb.move_sheet(report_sheet_name, -3)
-        wb.move_sheet('정리테이블', 2)
-
+    update_report_sheet(wb, year_str, month_str)
     wb.save(out_path)
     return out_path
 
-# ----------------- GUI 구성 -----------------
 
-def show_version():
-    messagebox.showinfo(
-        "버전 정보",
-        f"근태 자동정리 프로그램 {APP_VERSION}\n"
-        f"빌드일자: {BUILD_DATE}\n"
-        f"개발자: {DEVELOPER}"
-    )
+# ---------------------- GUI ----------------------
+VERSION = "v1.1.0"
+BUILD_DATE = "2025-11-07"
+DEVELOPER = "왕형순"
 
-def run_app():
-    root = tk.Tk()
-    root.title("근태 자동정리 프로그램")
-    root.geometry("500x350")
 
-    tk.Label(root, text="근태 자동정리 프로그램", font=("맑은 고딕", 14, "bold")).grid(row=0, column=0, columnspan=3, pady=15)
+def show_version_info():
+    msg = f"근태 정리 자동화 프로그램\n\n버   전: {VERSION}\n빌드일: {BUILD_DATE}\n개발자: {DEVELOPER}"
+    messagebox.showinfo("버전 정보", msg)
 
-    def select_office_file():
-        path = filedialog.askopenfilename(title="사무실 근태 파일 선택", filetypes=[("Excel Files", "*.xlsx *.xls")])
-        if path:
-            office_var.set(path)
 
-    def select_factory_file():
-        path = filedialog.askopenfilename(title="공장 근태 파일 선택", filetypes=[("Excel Files", "*.xlsx *.xls")])
-        if path:
-            factory_var.set(path)
+def run_processing(progress_var, execute_button):
+    """비동기 실행 함수"""
+    try:
+        # Step 1: 입력값 확인
+        # 진행률 표시 (실행중 모드 진입)
+        root.geometry("480x280")
+        progress_frame.grid(row=6, column=0, columnspan=3, pady=10)
+        progress_var.set(0)
 
-    def execute():
-        # 년월 입력 확인
+        execute_button.config(text="실행중...", state=tk.DISABLED)
+
+        # 단계별 진행률 갱신
+        progress_var.set(10)
+        root.update()
+
         year_str = year_entry.get().strip()
         month_str = month_entry.get().strip()
+        factory_path = factory_entry.get().strip()
+        office_path = office_entry.get().strip()
+
         if not (year_str and month_str):
-            messagebox.showerror("오류", "년도와 월을 모두 입력해주세요.")
+            messagebox.showerror("입력 오류", "년, 월을 모두 입력하세요.")
             return
 
-        factory_path = factory_var.get().strip()
-        office_path = office_var.get().strip()
+        # Step 2: 데이터 처리
+        progress_var.set(30)
+        root.update()
 
-        try:
-            factory_df = process_factory(factory_path) if factory_path else None
-            office_df = process_office(office_path) if office_path else None
-            merged_df = merge_data(factory_df, office_df)
-            out_file = update_excel(factory_df, office_df, merged_df, year_str, month_str)
-            messagebox.showinfo("완료", f"근태 파일 갱신 완료!\n{out_file}")
-        except Exception as e:
-            import traceback
-            messagebox.showerror("에러 발생", traceback.format_exc())
+        factory_df = process_factory(factory_path) if factory_path else None
+        office_df = process_office(office_path, year_str, month_str) if office_path else None
+        dfs = [d for d in [factory_df, office_df] if d is not None]
+        merged_df = pd.concat(dfs, ignore_index=True) if dfs else None
 
-    # 폰트 및 정렬
-    label_font = ("맑은 고딕", 11)
-    entry_width = 25
-    button_width = 15
+        # Step 3: 엑셀 갱신
+        progress_var.set(70)
+        root.update()
 
-    # UI 구성
-    tk.Label(root, text="년도:", font=label_font).grid(row=1, column=0, padx=10, pady=10, sticky="e")
-    year_entry = tk.Entry(root, width=entry_width)
-    year_entry.grid(row=1, column=1, padx=5)
+        if merged_df is not None:
+            out_path = update_excel(factory_df, office_df, merged_df, year_str, month_str)
+            progress_var.set(100)
+            root.update()
+            messagebox.showinfo("완료", f"근태기록 갱신 완료!\n\n{out_path}")
+        else:
+            messagebox.showwarning("데이터 없음", "입력된 근태 데이터가 없습니다.")
 
-    tk.Label(root, text="월:", font=label_font).grid(row=2, column=0, padx=10, pady=10, sticky="e")
-    month_entry = tk.Entry(root, width=entry_width)
-    month_entry.grid(row=2, column=1, padx=5)
+    except Exception as e:
+        messagebox.showerror("오류", f"실행 중 오류 발생:\n{e}")
 
-    office_var = tk.StringVar()
-    factory_var = tk.StringVar()
+    finally:
+        # 실행 후 복원
+        execute_button.config(text="실행", state=tk.NORMAL)
+        progress_var.set(0)
+        progress_frame.grid_remove()
+        root.geometry("480x200")
+        root.update()
 
-    tk.Label(root, text="사무실 근태 파일:", font=label_font).grid(row=3, column=0, padx=10, pady=10, sticky="e")
-    tk.Entry(root, textvariable=office_var, width=entry_width).grid(row=3, column=1)
-    tk.Button(root, text="찾기", command=select_office_file, width=button_width).grid(row=3, column=2, padx=5)
 
-    tk.Label(root, text="공장 근태 파일:", font=label_font).grid(row=4, column=0, padx=10, pady=10, sticky="e")
-    tk.Entry(root, textvariable=factory_var, width=entry_width).grid(row=4, column=1)
-    tk.Button(root, text="찾기", command=select_factory_file, width=button_width).grid(row=4, column=2, padx=5)
+def execute_async():
+    """실행 버튼 클릭 시 비동기로 실행"""
+    thread = threading.Thread(target=run_processing, args=(progress_var, execute_button))
+    thread.start()
 
-    tk.Button(root, text="실행", command=execute, width=button_width, bg="#4CAF50", fg="white").grid(row=5, column=1, pady=15)
-    tk.Button(root, text="버전 정보", command=show_version, width=button_width).grid(row=6, column=1, pady=5)
 
-    root.mainloop()
+# ---------------------- GUI 생성 ----------------------
+root = tk.Tk()
+root.title("근태기록 자동 정리기")
+root.geometry("480x200")
 
-if __name__ == "__main__":
-    run_app()
+tk.Label(root, text="년도 (YYYY):").grid(row=0, column=0, sticky="e", padx=5, pady=5)
+year_entry = tk.Entry(root, width=40); year_entry.grid(row=0, column=1)
+
+tk.Label(root, text="월 (MM):").grid(row=1, column=0, sticky="e", padx=5, pady=5)
+month_list = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+month_entry = ttk.Combobox(root, values=month_list, width=37); month_entry.grid(row=1, column=1)
+
+tk.Label(root, text="공장 근태 파일:").grid(row=2, column=0, sticky="e", padx=5, pady=5)
+factory_entry = tk.Entry(root, width=40); factory_entry.grid(row=2, column=1)
+tk.Button(root, text="찾기", width=8, command=lambda: factory_entry.insert(0, filedialog.askopenfilename())).grid(row=2, column=2, sticky="e")
+
+tk.Label(root, text="사무실 근태 파일:").grid(row=3, column=0, sticky="e", padx=5, pady=5)
+office_entry = tk.Entry(root, width=40); office_entry.grid(row=3, column=1)
+tk.Button(root, text="찾기", width=8, command=lambda: office_entry.insert(0, filedialog.askopenfilename())).grid(row=3, column=2, sticky="e")
+
+# 실행 버튼 + 버전 버튼
+execute_button = tk.Button(root, text="실행", width=15, command=execute_async)
+execute_button.grid(row=5, column=1, pady=15)
+tk.Button(root, text="버전정보", width=10, command=show_version_info).grid(row=5, column=2, pady=15)
+
+# 진행률 표시 프레임 (기본 숨김)
+progress_frame = tk.Frame(root)
+progress_var = tk.DoubleVar()
+progress_bar = ttk.Progressbar(progress_frame, variable=progress_var, maximum=100, length=300)
+progress_bar.grid(row=0, column=0, padx=10)
+progress_frame.grid_remove()  # 처음엔 숨김
+
+root.mainloop()
