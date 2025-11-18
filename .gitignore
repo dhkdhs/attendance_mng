@@ -16,6 +16,9 @@ build/
 # 실행 파일 관련
 *.spec
 
+# 결과 파일 관련
+output/
+
 # Jupyter Notebook
 .ipynb_checkpoints
 

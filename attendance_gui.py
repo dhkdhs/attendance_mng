@@ -4,19 +4,33 @@ import shutil
 import pandas as pd
 from pathlib import Path
 import datetime
-import time
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from openpyxl import load_workbook
 from openpyxl.utils.dataframe import dataframe_to_rows
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, Tuple, Optional
 from openpyxl.worksheet.worksheet import Worksheet
 
 
 # ---------------------- 공용 유틸 ----------------------
+# 이사진 성명
+director_list = ['강두영', '강병수', '정재황']
+
+def director_check(name: str) -> int:
+    """
+    이사직은 철야근무가 있으므로 7줄, 그 외는 6줄을 조정함
+    """
+    row_adj = 7
+    if name in director_list:
+        row_adj = 8
+    return row_adj
+
+
 def resource_path(relative_path: str) -> str:
-    """PyInstaller 빌드 후에도 템플릿 등 리소스 접근 가능"""
+    """
+    PyInstaller 빌드 후에도 템플릿 등 리소스 접근 가능
+    """
     try:
         base_path = sys._MEIPASS
     except Exception:
@@ -25,7 +39,9 @@ def resource_path(relative_path: str) -> str:
 
 
 def safe_to_hm(value: str) -> Optional[str]:
-    """시간값을 'HH:MM' 문자열로 변환"""
+    """
+    시간값을 'HH:MM' 문자열로 변환
+    """
     if pd.isna(value):
         return None
     try:
@@ -37,7 +53,9 @@ def safe_to_hm(value: str) -> Optional[str]:
 
 # ---------------------- 데이터 처리 ----------------------
 def process_factory(factory_path: str):
-    """공장 근태 raw 데이터 파싱"""
+    """
+    공장 근태 raw 데이터 파싱
+    """
     if not factory_path:
         return pd.DataFrame(columns=['성명','사번','부서','날짜','출근시간','퇴근시간'])
     try:
@@ -78,7 +96,9 @@ def process_factory(factory_path: str):
 
 
 def process_office(office_path: str, year: str, month: str):
-    # """사무실 근태 raw 데이터 파싱"""
+    """
+    사무실 근태 raw 데이터 파싱
+    """
     if not office_path:
         return pd.DataFrame(columns=['성명','사번','부서','날짜','출근시간','퇴근시간'])
     try:
@@ -114,13 +134,28 @@ def process_office(office_path: str, year: str, month: str):
     # 모든 컬럼명에서 공백 제거
     df.columns = df.columns.str.strip()
 
-    for col in ['출근시간','퇴근시간']:
-        df[col] = pd.to_datetime(df[col], format="%H:%M", errors='coerce').dt.time
+    df['사번'] = df['사번'].astype(int)
     df['날짜'] = pd.to_datetime(f"2025-10-" + df['일'].astype(str)).dt.date
     df = df.drop(columns=['부서','일'])
     df['구분'] = '사무실'
     df = df.reindex(columns=['성명','사번','날짜','출근시간','퇴근시간','구분'])
     return df
+
+
+def merge_table(factory_df, office_df):
+    """
+    두 시트 데이터 결합
+    """
+    df = pd.concat([factory_df, office_df], ignore_index=True)
+
+    # 성명, 사번, 날짜 기준으로 그룹화하여 병합
+    df_summary = df.groupby(['성명', '사번', '날짜'], as_index=False).agg({
+        '출근시간': 'min',   # 가장 빠른 출근시간
+        '퇴근시간': 'max',   # 가장 늦은 퇴근시간
+        '구분': lambda x: ','.join(sorted(set(x.dropna())))  # 여러 구분값이 있을 경우 병합
+    })
+
+    return df_summary
 
 
 # ---------------------- 보고용 시트 매핑 ----------------------
@@ -152,6 +187,7 @@ def iter_parse_report_sheet(ws: Worksheet, year_str: str, month_str: str) -> Dic
         if val != '성명' and pd.notna(val):
             val_split = val.splitlines()
             name = val_split[0]
+            row_adj = director_check(name)
 
             for c in range(3, ws.max_column + 1):
                 day = ws.cell(r, c).value
@@ -159,13 +195,17 @@ def iter_parse_report_sheet(ws: Worksheet, year_str: str, month_str: str) -> Dic
                     if 1 <= int(day) <= 31:
                         day_of_week = datetime.date(int(year_str), int(month_str), day).weekday()
                         day_cells[day] = (r, c, day_of_week)
+                        # 보고용 시트에 날짜 입력
+                        ws.cell(r, c).value = to_day_on_sheet(day, day_of_week)
 
             for c in range(3, ws.max_column + 1):
-                day = ws.cell(r+8, c).value
+                day = ws.cell(r+row_adj, c).value
                 if pd.notna(day) and isinstance(day, int):
                     if 1 <= int(day) <= 31:
                         day_of_week = datetime.date(int(year_str), int(month_str), day).weekday()
-                        day_cells[day] = (r+8, c, day_of_week)
+                        day_cells[day] = (r+row_adj, c, day_of_week)
+                        # 보고용 시트에 날짜 입력
+                        ws.cell(r+row_adj, c).value = to_day_on_sheet(day, day_of_week)
 
             result_cells[name] = day_cells
     return result_cells
@@ -173,12 +213,18 @@ def iter_parse_report_sheet(ws: Worksheet, year_str: str, month_str: str) -> Dic
 
 def find_target_row(ws: Worksheet, name: str, header_row: int) -> Optional[int]:
     for r in range(header_row + 1, min(ws.max_row, header_row + 6)):
+        n_name = ''
         n = ws.cell(r, 1).value
         if n is not None:
             n_split = n.splitlines()
             n_name = n_split[0]
-            if n_name == name:
-                return r
+        else:
+            row_adj = director_check(name)
+            n_adj = ws.cell(r-row_adj, 1).value
+            n_split = n_adj.splitlines()
+            n_name = n_split[0]
+        if n_name == name:
+            return r
     return None
 
 
@@ -217,14 +263,18 @@ def apply_attendance(ws: Worksheet, df: pd.DataFrame, year_str: str, month_str: 
             if not target_row:
                 continue
 
+            # 이사직은 철야근무가 있으므로 7줄, 그 외는 6줄을 조정함
+            director_flag = False
+            if key in director_list:
+                director_flag = True
+
             row_in = target_row             # 출근시간
             row_out = target_row + 1        # 퇴근시간
             row_work = target_row + 2       # 근무시간
             row_ot = target_row + 3         # 연장근무
             row_holiday = target_row + 4    # 휴일근무
-
-            # 보고용 시트에 날짜 입력
-            ws.cell(header_row, col).value = to_day_on_sheet(day, day_of_weekday)
+            if director_flag:
+                row_night = target_row + 5  # 철야근무
 
             # 출근시간 및 퇴근시간
             if s:
@@ -240,23 +290,50 @@ def apply_attendance(ws: Worksheet, df: pd.DataFrame, year_str: str, month_str: 
                 work_hours = round((e_dt - s_dt).seconds / 3600, 1)
                 ws.cell(row_work, col).value = work_hours
 
-            # 연장근무 (퇴근 > 17:00)
-            if s and e and e > datetime.time(17, 0):
-                after5 = (datetime.datetime.combine(datetime.datetime.today(), e) -
-                            datetime.datetime.combine(datetime.datetime.today(), datetime.time(17, 0))).seconds / 3600
-                ws.cell(row_ot, col).value = round(after5, 1)
+            # 연장근무 (출근 < 8:00, 퇴근 > 17:00)
+            if s and e and (s > datetime.time(5, 0) and s < datetime.time(8, 0)) or (e > datetime.time(17, 0) and e < datetime.time(23, 0)):
+                before8 = 0
+                after17 = 0
+
+                if s > datetime.time(5, 0) and s < datetime.time(8, 0):
+                    before8 = (datetime.datetime.combine(datetime.datetime.today(), datetime.time(8, 0)) -
+                                datetime.datetime.combine(datetime.datetime.today(), s)).seconds / 3600
+                if e > datetime.time(17, 0) and e < datetime.time(23, 0):
+                    after17 = (datetime.datetime.combine(datetime.datetime.today(), e) -
+                                datetime.datetime.combine(datetime.datetime.today(), datetime.time(17, 0))).seconds / 3600
+
+                ws.cell(row_ot, col).value = round(before8 + after17, 1)
             else:
-                ws.cell(row_ot, col).value = ""
+                ws.cell(row_ot, col).value = "-"
 
             # 휴일근무 (토:5, 일:6)
             if day_of_weekday in (5, 6) and work_hours:
                 ws.cell(row_holiday, col).value = work_hours
             else:
-                ws.cell(row_holiday, col).value = ""
+                ws.cell(row_holiday, col).value = "-"
+
+            # 철야근무 (근무 시간 -> 23:00 - 05:00)
+            if director_flag:
+                if s and e and (e > datetime.time(23, 0) and s < datetime.time(5, 0)):
+                    before5 = 0
+                    after23 = 0
+
+                    if s < datetime.time(5, 0):
+                        before5 = (datetime.datetime.combine(datetime.datetime.today(), datetime.time(5, 0)) -
+                                    datetime.datetime.combine(datetime.datetime.today(), s)).seconds / 3600
+                    if e > datetime.time(23, 0):
+                        after23 = (datetime.datetime.combine(datetime.datetime.today(), e) -
+                                    datetime.datetime.combine(datetime.datetime.today(), datetime.time(23, 0))).seconds / 3600
+
+                    ws.cell(row_night, col).value = round(before5 + after23, 1)
+                else:
+                    ws.cell(row_night, col).value = "-"
 
 
 def update_report_sheet(wb, year_str: str, month_str: str):
-    """정리테이블 → {YY.MM} 시트 반영"""
+    """
+    정리테이블 → {YY.MM} 시트 반영
+    """
     sheet_name = f"{year_str[2:]}.{month_str}"
     if "정리테이블" not in wb.sheetnames:
         return
@@ -310,8 +387,8 @@ def update_excel(factory_df, office_df, merged_df, year_str, month_str):
 
 
 # ---------------------- GUI ----------------------
-VERSION = "v1.1.0"
-BUILD_DATE = "2025-11-07"
+VERSION = "v1.1.1"
+BUILD_DATE = "2025-11-18"
 DEVELOPER = "왕형순"
 
 
@@ -321,11 +398,13 @@ def show_version_info():
 
 
 def run_processing(progress_var, execute_button):
-    """비동기 실행 함수"""
+    """
+    비동기 실행 함수
+    """
     try:
         # Step 1: 입력값 확인
         # 진행률 표시 (실행중 모드 진입)
-        root.geometry("480x280")
+        root.geometry("480x250")
         progress_frame.grid(row=6, column=0, columnspan=3, pady=10)
         progress_var.set(0)
 
@@ -350,8 +429,8 @@ def run_processing(progress_var, execute_button):
 
         factory_df = process_factory(factory_path) if factory_path else None
         office_df = process_office(office_path, year_str, month_str) if office_path else None
-        dfs = [d for d in [factory_df, office_df] if d is not None]
-        merged_df = pd.concat(dfs, ignore_index=True) if dfs else None
+        if factory_df is not None and office_df is not None:
+            merged_df = merge_table(factory_df, office_df)
 
         # Step 3: 엑셀 갱신
         progress_var.set(70)
@@ -378,7 +457,9 @@ def run_processing(progress_var, execute_button):
 
 
 def execute_async():
-    """실행 버튼 클릭 시 비동기로 실행"""
+    """
+    실행 버튼 클릭 시 비동기로 실행
+    """
     thread = threading.Thread(target=run_processing, args=(progress_var, execute_button))
     thread.start()
 
